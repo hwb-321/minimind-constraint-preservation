@@ -15,6 +15,43 @@
 
 ---
 
+## Artifacts
+
+由于训练数据、模型权重和评测结果文件较大，GitHub 仓库只保存代码和说明文档。完整实验 artifacts 已上传到 Google Drive：
+
+- Google Drive: https://drive.google.com/open?id=1FBbFLyp48K49UQ5PowwewWKDSFUr5qaR
+- Drive folder name: `minimind-constraint-preservation-artifacts`
+
+下载后请保持下面的目录结构放在项目根目录：
+
+```text
+minimind/
+├── dataset/
+├── out/
+├── result_all/
+└── result_all_attention_fix/
+```
+
+其中：
+
+- `dataset/`：`<calc>` 训练集、干净测试集和不同长度的 alpha/digit 前缀噪声测试集。
+- `out/`：实验使用的 MiniMind 权重，包括 `full_sft_calc_768.pth`。
+- `result_all/`：baseline 和 YaRN 等批量评测结果。
+- `result_all_attention_fix/`：test-time attention block 的评测结果。
+
+如果使用 `rclone` 下载，可以执行：
+
+```bash
+rclone copy gdrive:minimind-constraint-preservation-artifacts/dataset dataset -P
+rclone copy gdrive:minimind-constraint-preservation-artifacts/out out -P
+rclone copy gdrive:minimind-constraint-preservation-artifacts/result_all result_all -P
+rclone copy gdrive:minimind-constraint-preservation-artifacts/result_all_attention_fix result_all_attention_fix -P
+```
+
+如果直接用浏览器下载，解压后把四个目录移动到仓库根目录即可。
+
+---
+
 ## 1. 项目目标
 
 核心问题：
