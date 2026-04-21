@@ -4,3 +4,13 @@ __pycache__/
 out
 website/
 docs-minimind/
+.codex
+dataset/*.jsonl
+*.bak*
+*.pth
+checkpoints/
+results/
+result_all/
+result_all_attention_fix/
+result_noise_fold_smoke/
+result_suffix_anchor/

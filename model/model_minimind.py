@@ -78,8 +78,16 @@ def precompute_freqs_cis(dim: int, end: int = int(32 * 1024), rope_base: float =
 
 def apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):
     def rotate_half(x): return torch.cat((-x[..., x.shape[-1] // 2:], x[..., : x.shape[-1] // 2]), dim=-1)
-    q_embed = ((q * cos.unsqueeze(unsqueeze_dim)) + (rotate_half(q) * sin.unsqueeze(unsqueeze_dim))).to(q.dtype)
-    k_embed = ((k * cos.unsqueeze(unsqueeze_dim)) + (rotate_half(k) * sin.unsqueeze(unsqueeze_dim))).to(k.dtype)
+    if cos.dim() == 2:
+        cos = cos.unsqueeze(unsqueeze_dim)
+        sin = sin.unsqueeze(unsqueeze_dim)
+    elif cos.dim() == 3:
+        cos = cos.unsqueeze(2)
+        sin = sin.unsqueeze(2)
+    else:
+        raise ValueError(f"Unsupported RoPE tensor rank: cos.dim()={cos.dim()}")
+    q_embed = ((q * cos) + (rotate_half(q) * sin)).to(q.dtype)
+    k_embed = ((k * cos) + (rotate_half(k) * sin)).to(k.dtype)
     return q_embed, k_embed
 
 def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
@@ -121,17 +129,27 @@ class Attention(nn.Module):
             xv = torch.cat([past_key_value[1], xv], dim=1)
         past_kv = (xk, xv) if use_cache else None
         xq, xk, xv = (xq.transpose(1, 2), repeat_kv(xk, self.n_rep).transpose(1, 2), repeat_kv(xv, self.n_rep).transpose(1, 2))
-        if self.flash and (seq_len > 1) and (not self.is_causal or past_key_value is None) and (attention_mask is None or torch.all(attention_mask == 1)):
+        explicit_attn_mask = attention_mask is not None and attention_mask.dim() >= 3
+        if self.flash and (seq_len > 1) and (not self.is_causal or past_key_value is None) and (attention_mask is None or (attention_mask.dim() == 2 and torch.all(attention_mask == 1))):
             output = F.scaled_dot_product_attention(xq, xk, xv, dropout_p=self.dropout if self.training else 0.0, is_causal=self.is_causal)
         else:
             scores = (xq @ xk.transpose(-2, -1)) / math.sqrt(self.head_dim)
-            if self.is_causal: scores[:, :, :, -seq_len:] += torch.full((seq_len, seq_len), float("-inf"), device=scores.device).triu(1)
-            if attention_mask is not None: scores += (1.0 - attention_mask.unsqueeze(1).unsqueeze(2)) * -1e9
+            if self.is_causal and not explicit_attn_mask:
+                scores[:, :, :, -seq_len:] += torch.full((seq_len, seq_len), float("-inf"), device=scores.device).triu(1)
+            if attention_mask is not None:
+                if attention_mask.dim() == 2:
+                    scores += (1.0 - attention_mask.unsqueeze(1).unsqueeze(2)) * -1e9
+                elif attention_mask.dim() == 3:
+                    scores = scores.masked_fill(~attention_mask.unsqueeze(1), float("-inf"))
+                elif attention_mask.dim() == 4:
+                    scores = scores.masked_fill(~attention_mask, float("-inf"))
+                else:
+                    raise ValueError("Unsupported attention_mask rank.")
             output = self.attn_dropout(F.softmax(scores.float(), dim=-1).type_as(xq)) @ xv
         output = output.transpose(1, 2).reshape(bsz, seq_len, -1)
         output = self.resid_dropout(self.o_proj(output))
         return output, past_kv
-
+ 
 class FeedForward(nn.Module):
     def __init__(self, config: MiniMindConfig, intermediate_size: int = None):
         super().__init__()
@@ -236,7 +254,13 @@ class MiniMindForCausalLM(PreTrainedModel, GenerationMixin):
         self.model.embed_tokens.weight = self.lm_head.weight
     
     def forward(self, input_ids, attention_mask=None, past_key_values=None, use_cache=False, logits_to_keep=0, labels=None, **kwargs):
-        hidden_states, past_key_values, aux_loss = self.model(input_ids, attention_mask, past_key_values, use_cache, **kwargs)
+        hidden_states, past_key_values, aux_loss = self.model(
+            input_ids,
+            attention_mask,
+            past_key_values,
+            use_cache,
+            **kwargs
+        )
         slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
         logits = self.lm_head(hidden_states[:, slice_indices, :])
         loss = None
@@ -251,12 +275,32 @@ class MiniMindForCausalLM(PreTrainedModel, GenerationMixin):
         input_ids = kwargs.pop("input_ids", inputs).repeat(num_return_sequences, 1)
         attention_mask = attention_mask.repeat(num_return_sequences, 1) if attention_mask is not None else None
         past_key_values = kwargs.pop("past_key_values", None)
+        custom_attention_mask = kwargs.pop("custom_attention_mask", None)
+        blocking_calc_start = kwargs.pop("blocking_calc_start", None)
+        blocking_keep_prefix = kwargs.pop("blocking_keep_prefix", 0)
+        if custom_attention_mask is not None:
+            if custom_attention_mask.dim() == 2:
+                custom_attention_mask = custom_attention_mask.unsqueeze(0)
+            if custom_attention_mask.dim() == 3 and custom_attention_mask.size(0) == 1:
+                custom_attention_mask = custom_attention_mask.repeat(num_return_sequences, 1, 1)
+            elif custom_attention_mask.dim() != 3 or custom_attention_mask.size(0) != input_ids.size(0):
+                raise ValueError("custom_attention_mask shape is incompatible with num_return_sequences.")
         finished = torch.zeros(input_ids.shape[0], dtype=torch.bool, device=input_ids.device)
         if streamer: streamer.put(input_ids.cpu())
         for _ in range(max_new_tokens):
             past_len = past_key_values[0][0].shape[1] if past_key_values else 0
-            outputs = self.forward(input_ids[:, past_len:], attention_mask, past_key_values, use_cache=use_cache, **kwargs)
-            attention_mask = torch.cat([attention_mask, attention_mask.new_ones(attention_mask.shape[0], 1)], -1) if attention_mask is not None else None
+            current_attention_mask = attention_mask
+            if custom_attention_mask is not None:
+                current_attention_mask = custom_attention_mask[:, past_len:input_ids.size(1), :input_ids.size(1)]
+            outputs = self.forward(
+                input_ids[:, past_len:],
+                current_attention_mask,
+                past_key_values,
+                use_cache=use_cache,
+                **kwargs
+            )
+            if custom_attention_mask is None:
+                attention_mask = torch.cat([attention_mask, attention_mask.new_ones(attention_mask.shape[0], 1)], -1) if attention_mask is not None else None
             logits = outputs.logits[:, -1, :] / temperature
             if repetition_penalty != 1.0:
                 for i in range(input_ids.shape[0]): logits[i, torch.unique(input_ids[i])] /= repetition_penalty
@@ -270,6 +314,22 @@ class MiniMindForCausalLM(PreTrainedModel, GenerationMixin):
             next_token = torch.multinomial(torch.softmax(logits, dim=-1), num_samples=1) if do_sample else torch.argmax(logits, dim=-1, keepdim=True)
             if eos_token_id is not None: next_token = torch.where(finished.unsqueeze(-1), next_token.new_full((next_token.shape[0], 1), eos_token_id), next_token)
             input_ids = torch.cat([input_ids, next_token], dim=-1)
+            if custom_attention_mask is not None:
+                new_masks = []
+                for row_mask in custom_attention_mask:
+                    new_len = row_mask.size(0) + 1
+                    expanded = torch.zeros(new_len, new_len, dtype=torch.bool, device=row_mask.device)
+                    expanded[: row_mask.size(0), : row_mask.size(1)] = row_mask
+                    row_allowed = torch.zeros(new_len, dtype=torch.bool, device=row_mask.device)
+                    if blocking_keep_prefix > 0:
+                        row_allowed[: min(blocking_keep_prefix, new_len)] = True
+                    if blocking_calc_start is None:
+                        row_allowed[:new_len] = True
+                    else:
+                        row_allowed[blocking_calc_start:new_len] = True
+                    expanded[new_len - 1] = row_allowed
+                    new_masks.append(expanded)
+                custom_attention_mask = torch.stack(new_masks, dim=0)
             past_key_values = outputs.past_key_values if use_cache else None
             if streamer: streamer.put(next_token.cpu())
             if eos_token_id is not None:

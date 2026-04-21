@@ -5,6 +5,8 @@ __package__ = "trainer"
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 import argparse
+import json
+import re
 import time
 import warnings
 import torch
@@ -18,6 +20,122 @@ from dataset.lm_dataset import SFTDataset
 from trainer.trainer_utils import get_lr, Logger, is_main_process, lm_checkpoint, init_distributed_mode, setup_seed, init_model, SkipBatchSampler
 
 warnings.filterwarnings('ignore')
+
+
+def normalize_text(text):
+    return re.sub(r"\s+", " ", text.strip())
+
+
+def extract_calc_answer(text):
+    match = re.search(r"<calc>\s*(.*?)\s*</calc>", text, flags=re.DOTALL)
+    body = match.group(1) if match else text
+    if "=" in body:
+        body = body.split("=", 1)[1]
+    return normalize_text(body)
+
+
+def compare_prediction(prediction, target, match_mode):
+    if match_mode == "full":
+        return normalize_text(prediction) == normalize_text(target)
+    return extract_calc_answer(prediction) == extract_calc_answer(target)
+
+
+def save_current_model(weight_name):
+    moe_suffix = '_moe' if lm_config.use_moe else ''
+    ckp = f'{args.save_dir}/{weight_name}_{lm_config.hidden_size}{moe_suffix}.pth'
+    raw_model = model.module if isinstance(model, DistributedDataParallel) else model
+    raw_model = getattr(raw_model, '_orig_mod', raw_model)
+    state_dict = raw_model.state_dict()
+    torch.save({k: v.half().cpu() for k, v in state_dict.items()}, ckp)
+    del state_dict
+    return ckp
+
+
+def evaluate_calc_dataset(weight_name, epoch_idx):
+    if not args.eval_data_path or not is_main_process():
+        return None
+
+    model.eval()
+    total = 0
+    correct = 0
+    shown = 0
+    results_file = None
+    results_path = None
+
+    if args.eval_results_dir:
+        os.makedirs(args.eval_results_dir, exist_ok=True)
+        results_path = os.path.join(args.eval_results_dir, f"{weight_name}_epoch{epoch_idx + 1}.jsonl")
+        results_file = open(results_path, "w", encoding="utf-8")
+
+    with open(args.eval_data_path, "r", encoding="utf-8") as f:
+        for line in f:
+            if args.eval_limit and total >= args.eval_limit:
+                break
+
+            sample = json.loads(line)
+            prompt = sample["conversations"][0]["content"]
+            target = sample["conversations"][1]["content"]
+            messages = [{"role": "user", "content": prompt}]
+            text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+            inputs = tokenizer(text, return_tensors="pt").to(args.device)
+
+            with torch.no_grad():
+                generated = model.generate(
+                    inputs=inputs["input_ids"],
+                    attention_mask=inputs["attention_mask"],
+                    max_new_tokens=args.eval_max_new_tokens,
+                    do_sample=False,
+                    pad_token_id=tokenizer.pad_token_id,
+                    eos_token_id=tokenizer.eos_token_id,
+                )
+
+            prediction = tokenizer.decode(
+                generated[0][len(inputs["input_ids"][0]):],
+                skip_special_tokens=True,
+            )
+
+            target_answer = extract_calc_answer(target)
+            pred_answer = extract_calc_answer(prediction)
+            is_correct = compare_prediction(prediction, target, args.eval_match_mode)
+            correct += int(is_correct)
+            total += 1
+
+            if results_file is not None:
+                record = {
+                    "index": total,
+                    "prompt": prompt,
+                    "target": target,
+                    "prediction": prediction,
+                    "target_answer": target_answer,
+                    "pred_answer": pred_answer,
+                    "is_correct": is_correct,
+                    "match_mode": args.eval_match_mode,
+                    "weight": weight_name,
+                    "epoch": epoch_idx + 1,
+                    "data_path": args.eval_data_path,
+                }
+                results_file.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+            if not is_correct and shown < args.eval_show_examples:
+                Logger('-' * 100)
+                Logger(f'[Eval Mismatch] epoch={epoch_idx + 1}, sample={total}')
+                Logger(f'Prompt : {prompt}')
+                Logger(f'Target : {target}')
+                Logger(f'Pred   : {prediction}')
+                if args.eval_match_mode == "answer_only":
+                    Logger(f'Target answer: {target_answer}')
+                    Logger(f'Pred answer  : {pred_answer}')
+                shown += 1
+
+    if results_file is not None:
+        results_file.close()
+
+    accuracy = correct / total if total else 0.0
+    Logger(f'[Eval] Epoch {epoch_idx + 1}: accuracy={correct}/{total}={accuracy:.4%}')
+    if results_path:
+        Logger(f'[Eval] Saved per-example results to {results_path}')
+    model.train()
+    return accuracy
 
 
 def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
@@ -59,16 +177,10 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
 
         if (step % args.save_interval == 0 or step == iters) and is_main_process():
             model.eval()
-            moe_suffix = '_moe' if lm_config.use_moe else ''
-            ckp = f'{args.save_dir}/{args.save_weight}_{lm_config.hidden_size}{moe_suffix}.pth'
-            raw_model = model.module if isinstance(model, DistributedDataParallel) else model
-            raw_model = getattr(raw_model, '_orig_mod', raw_model)
-            state_dict = raw_model.state_dict()
-            torch.save({k: v.half().cpu() for k, v in state_dict.items()}, ckp)
+            save_current_model(args.save_weight)
             lm_checkpoint(lm_config, weight=args.save_weight, model=model, optimizer=optimizer, 
                          epoch=epoch, step=step, wandb=wandb, save_dir='../checkpoints', scaler=scaler)
             model.train()
-            del state_dict
 
         del input_ids, labels, res, loss
 
@@ -104,6 +216,13 @@ if __name__ == "__main__":
     parser.add_argument("--use_wandb", action="store_true", help="是否使用wandb")
     parser.add_argument("--wandb_project", type=str, default="MiniMind-Full-SFT", help="wandb项目名")
     parser.add_argument("--use_compile", default=0, type=int, choices=[0, 1], help="是否使用torch.compile加速（0=否，1=是）")
+    parser.add_argument("--save_each_epoch", default=1, type=int, choices=[0, 1], help="是否在每个epoch结束时额外保存一个带epoch后缀的权重")
+    parser.add_argument("--eval_data_path", type=str, default="", help="可选：每个epoch结束后评测的calc测试集路径")
+    parser.add_argument("--eval_match_mode", type=str, default="answer_only", choices=["full", "answer_only"], help="calc评测匹配方式")
+    parser.add_argument("--eval_max_new_tokens", type=int, default=64, help="calc评测最大生成token数")
+    parser.add_argument("--eval_limit", type=int, default=0, help="可选：限制每轮评测样本数，0表示不限制")
+    parser.add_argument("--eval_show_examples", type=int, default=5, help="每轮评测打印多少个错误样例")
+    parser.add_argument("--eval_results_dir", type=str, default="../results", help="每轮评测逐条结果jsonl的输出目录")
     args = parser.parse_args()
 
     # ========== 1. 初始化环境和随机种子 ==========
@@ -166,6 +285,20 @@ if __name__ == "__main__":
             train_epoch(epoch, loader, len(loader) + skip, start_step, wandb)
         else:
             train_epoch(epoch, loader, len(loader), 0, wandb)
+
+        if is_main_process():
+            epoch_weight = args.save_weight
+            if args.save_each_epoch == 1:
+                epoch_weight = f"{args.save_weight}_epoch{epoch + 1}"
+                save_current_model(epoch_weight)
+                Logger(f'Saved epoch checkpoint to {args.save_dir}/{epoch_weight}_{lm_config.hidden_size}{"_moe" if lm_config.use_moe else ""}.pth')
+
+            eval_acc = evaluate_calc_dataset(epoch_weight, epoch)
+            if wandb and eval_acc is not None:
+                wandb.log({"eval_accuracy": eval_acc, "epoch": epoch + 1})
+
+        if dist.is_initialized():
+            dist.barrier()
     
     # ========== 9. 清理分布进程 ==========
     if dist.is_initialized(): dist.destroy_process_group()
