@@ -26,8 +26,11 @@ class MiniMindConfig(PretrainedConfig):
         self.intermediate_size = kwargs.get("intermediate_size", math.ceil(hidden_size * math.pi / 64) * 64)
         self.max_position_embeddings = kwargs.get("max_position_embeddings", 32768)
         self.rms_norm_eps = kwargs.get("rms_norm_eps", 1e-6)
+        self.use_qk_norm = kwargs.get("use_qk_norm", True)
         self.rope_theta = kwargs.get("rope_theta", 1e6)
         self.inference_rope_scaling = kwargs.get("inference_rope_scaling", False)
+        self.use_attention_gate = kwargs.get("use_attention_gate", False)
+        self.attention_gate_scale = kwargs.get("attention_gate_scale", 2.0)
         self.rope_scaling = {
             "beta_fast": 32,
             "beta_slow": 1,
@@ -108,12 +111,20 @@ class Attention(nn.Module):
         self.k_proj = nn.Linear(config.hidden_size, self.num_key_value_heads * self.head_dim, bias=False)
         self.v_proj = nn.Linear(config.hidden_size, self.num_key_value_heads * self.head_dim, bias=False)
         self.o_proj = nn.Linear(config.num_attention_heads * self.head_dim, config.hidden_size, bias=False)
-        self.q_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
-        self.k_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        self.use_qk_norm = config.use_qk_norm
+        if self.use_qk_norm:
+            self.q_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
+            self.k_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.attn_dropout = nn.Dropout(config.dropout)
         self.resid_dropout = nn.Dropout(config.dropout)
         self.dropout = config.dropout
         self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention') and config.flash_attn
+        self.use_attention_gate = config.use_attention_gate
+        self.attention_gate_scale = config.attention_gate_scale
+        if self.use_attention_gate:
+            self.attn_gate = nn.Linear(config.hidden_size, config.num_attention_heads, bias=True)
+            nn.init.zeros_(self.attn_gate.weight)
+            nn.init.zeros_(self.attn_gate.bias)
 
     def forward(self, x, position_embeddings, past_key_value=None, use_cache=False, attention_mask=None):
         bsz, seq_len, _ = x.shape
@@ -121,7 +132,8 @@ class Attention(nn.Module):
         xq = xq.view(bsz, seq_len, self.n_local_heads, self.head_dim)
         xk = xk.view(bsz, seq_len, self.n_local_kv_heads, self.head_dim)
         xv = xv.view(bsz, seq_len, self.n_local_kv_heads, self.head_dim)
-        xq, xk = self.q_norm(xq), self.k_norm(xk)
+        if self.use_qk_norm:
+            xq, xk = self.q_norm(xq), self.k_norm(xk)
         cos, sin = position_embeddings
         xq, xk = apply_rotary_pos_emb(xq, xk, cos, sin)
         if past_key_value is not None:
@@ -146,6 +158,9 @@ class Attention(nn.Module):
                 else:
                     raise ValueError("Unsupported attention_mask rank.")
             output = self.attn_dropout(F.softmax(scores.float(), dim=-1).type_as(xq)) @ xv
+        if self.use_attention_gate:
+            gate = self.attention_gate_scale * torch.sigmoid(self.attn_gate(x)).transpose(1, 2).unsqueeze(-1)
+            output = output * gate.to(output.dtype)
         output = output.transpose(1, 2).reshape(bsz, seq_len, -1)
         output = self.resid_dropout(self.o_proj(output))
         return output, past_kv

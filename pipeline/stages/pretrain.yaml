@@ -1,0 +1,28 @@
+script: trainer/train_pretrain.py
+distributed: true
+runtime:
+  nproc_per_node: 1
+  master_port: 29501
+  cuda_visible_devices: ""
+args:
+  save_dir: ./models
+  tokenizer_path: ./model
+  hidden_size: 768
+  num_hidden_layers: 8
+  num_attention_heads: 8
+  num_key_value_heads: 4
+  intermediate_size: 2432
+  rms_norm_eps: 0.000001
+  save_weight: baseline_pretrain
+  from_weight: none
+  use_wandb: true
+  wandb_project: MiniMind-3-Zero-Pretrain
+  data_path: ./dataset/pretrain_t2t_mini.jsonl
+  epochs: 2
+  batch_size: 128
+  learning_rate: 0.0005
+  max_seq_len: 380
+  accumulation_steps: 8
+  num_workers: 8
+  save_interval: 1000
+  log_interval: 1

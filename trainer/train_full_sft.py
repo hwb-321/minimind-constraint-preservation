@@ -15,7 +15,7 @@ from contextlib import nullcontext
 from torch import optim, nn
 from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader, DistributedSampler
-from model.model_minimind import MiniMindConfig
+from config_utils import config_bool, config_get, load_model_classes, load_project_config, project_path
 from dataset.lm_dataset import SFTDataset
 from trainer.trainer_utils import get_lr, Logger, is_main_process, lm_checkpoint, init_distributed_mode, setup_seed, init_model, SkipBatchSampler
 
@@ -193,36 +193,49 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
 
 
 if __name__ == "__main__":
+    project_config = load_project_config()
+    ConfigClass, ModelClass = load_model_classes(project_config)
+    default_train_device = config_get(project_config, "train.device", "auto")
+    if default_train_device == "auto":
+        default_train_device = "cuda:0" if torch.cuda.is_available() else "cpu"
     parser = argparse.ArgumentParser(description="MiniMind Full SFT")
-    parser.add_argument("--save_dir", type=str, default="../out", help="模型保存目录")
-    parser.add_argument('--save_weight', default='full_sft', type=str, help="保存权重的前缀名")
-    parser.add_argument("--epochs", type=int, default=2, help="训练轮数")
-    parser.add_argument("--batch_size", type=int, default=16, help="batch size")
-    parser.add_argument("--learning_rate", type=float, default=1e-5, help="初始学习率")
-    parser.add_argument("--device", type=str, default="cuda:0" if torch.cuda.is_available() else "cpu", help="训练设备")
-    parser.add_argument("--dtype", type=str, default="bfloat16", help="混合精度类型")
-    parser.add_argument("--num_workers", type=int, default=8, help="数据加载线程数")
-    parser.add_argument("--accumulation_steps", type=int, default=1, help="梯度累积步数")
-    parser.add_argument("--grad_clip", type=float, default=1.0, help="梯度裁剪阈值")
-    parser.add_argument("--log_interval", type=int, default=100, help="日志打印间隔")
-    parser.add_argument("--save_interval", type=int, default=1000, help="模型保存间隔")
-    parser.add_argument('--hidden_size', default=768, type=int, help="隐藏层维度")
-    parser.add_argument('--num_hidden_layers', default=8, type=int, help="隐藏层数量")
-    parser.add_argument('--max_seq_len', default=768, type=int, help="训练的最大截断长度（中文1token≈1.5~1.7字符）")
-    parser.add_argument('--use_moe', default=0, type=int, choices=[0, 1], help="是否使用MoE架构（0=否，1=是）")
-    parser.add_argument("--data_path", type=str, default="../dataset/sft_t2t_mini.jsonl", help="训练数据路径")
-    parser.add_argument('--from_weight', default='pretrain', type=str, help="基于哪个权重训练，为none则不基于任何权重训练")
-    parser.add_argument('--from_resume', default=0, type=int, choices=[0, 1], help="是否自动检测&续训（0=否，1=是）")
-    parser.add_argument("--use_wandb", action="store_true", help="是否使用wandb")
-    parser.add_argument("--wandb_project", type=str, default="MiniMind-Full-SFT", help="wandb项目名")
-    parser.add_argument("--use_compile", default=0, type=int, choices=[0, 1], help="是否使用torch.compile加速（0=否，1=是）")
-    parser.add_argument("--save_each_epoch", default=1, type=int, choices=[0, 1], help="是否在每个epoch结束时额外保存一个带epoch后缀的权重")
-    parser.add_argument("--eval_data_path", type=str, default="", help="可选：每个epoch结束后评测的calc测试集路径")
-    parser.add_argument("--eval_match_mode", type=str, default="answer_only", choices=["full", "answer_only"], help="calc评测匹配方式")
-    parser.add_argument("--eval_max_new_tokens", type=int, default=64, help="calc评测最大生成token数")
-    parser.add_argument("--eval_limit", type=int, default=0, help="可选：限制每轮评测样本数，0表示不限制")
-    parser.add_argument("--eval_show_examples", type=int, default=5, help="每轮评测打印多少个错误样例")
-    parser.add_argument("--eval_results_dir", type=str, default="../results", help="每轮评测逐条结果jsonl的输出目录")
+    parser.add_argument("--save_dir", type=str, default=project_path(config_get(project_config, "model.save_dir", "../out")), help="模型保存目录")
+    parser.add_argument("--tokenizer_path", type=str, default=project_path(config_get(project_config, "model.tokenizer_path", "./model")), help="tokenizer目录")
+    parser.add_argument('--save_weight', default=config_get(project_config, "train.save_weight", config_get(project_config, "model.weight", "full_sft")), type=str, help="保存权重的前缀名")
+    parser.add_argument("--epochs", type=int, default=config_get(project_config, "train.epochs", 2), help="训练轮数")
+    parser.add_argument("--batch_size", type=int, default=config_get(project_config, "train.batch_size", 16), help="batch size")
+    parser.add_argument("--learning_rate", type=float, default=config_get(project_config, "train.learning_rate", 1e-5), help="初始学习率")
+    parser.add_argument("--device", type=str, default=default_train_device, help="训练设备")
+    parser.add_argument("--dtype", type=str, default=config_get(project_config, "train.dtype", "bfloat16"), help="混合精度类型")
+    parser.add_argument("--num_workers", type=int, default=config_get(project_config, "train.num_workers", 8), help="数据加载线程数")
+    parser.add_argument("--accumulation_steps", type=int, default=config_get(project_config, "train.accumulation_steps", 1), help="梯度累积步数")
+    parser.add_argument("--grad_clip", type=float, default=config_get(project_config, "train.grad_clip", 1.0), help="梯度裁剪阈值")
+    parser.add_argument("--log_interval", type=int, default=config_get(project_config, "train.log_interval", 100), help="日志打印间隔")
+    parser.add_argument("--save_interval", type=int, default=config_get(project_config, "train.save_interval", 1000), help="模型保存间隔")
+    parser.add_argument('--hidden_size', default=config_get(project_config, "model.hidden_size", 768), type=int, help="隐藏层维度")
+    parser.add_argument('--num_hidden_layers', default=config_get(project_config, "model.num_hidden_layers", 8), type=int, help="隐藏层数量")
+    parser.add_argument('--num_attention_heads', default=config_get(project_config, "model.num_attention_heads", 8), type=int, help="attention head数量")
+    parser.add_argument('--num_key_value_heads', default=config_get(project_config, "model.num_key_value_heads", 4), type=int, help="key/value head数量")
+    parser.add_argument('--intermediate_size', default=config_get(project_config, "model.intermediate_size", None), type=int, help="MLP中间层维度")
+    parser.add_argument('--rms_norm_eps', default=config_get(project_config, "model.rms_norm_eps", 1e-6), type=float, help="RMSNorm epsilon")
+    parser.add_argument('--use_qk_norm', action="store_true", default=config_bool(project_config, "model.use_qk_norm", True), help="是否启用attention Q/K RMSNorm")
+    parser.add_argument('--max_seq_len', default=config_get(project_config, "train.max_seq_len", 768), type=int, help="训练的最大截断长度（中文1token≈1.5~1.7字符）")
+    parser.add_argument('--use_moe', default=int(config_bool(project_config, "model.use_moe", False)), type=int, choices=[0, 1], help="是否使用MoE架构（0=否，1=是）")
+    parser.add_argument("--use_attention_gate", action="store_true", default=config_bool(project_config, "attention_gate.enabled", False), help="是否启用Gated Softmax Attention")
+    parser.add_argument("--attention_gate_scale", default=config_get(project_config, "attention_gate.scale", 2.0), type=float, help="Gated Softmax Attention的sigmoid缩放系数")
+    parser.add_argument("--data_path", type=str, default=project_path(config_get(project_config, "train.data_path", "./dataset/sft_t2t_mini.jsonl")), help="训练数据路径")
+    parser.add_argument('--from_weight', default=config_get(project_config, "train.from_weight", "pretrain"), type=str, help="基于哪个权重训练，为none则不基于任何权重训练")
+    parser.add_argument('--from_resume', default=int(config_bool(project_config, "train.from_resume", False)), type=int, choices=[0, 1], help="是否自动检测&续训（0=否，1=是）")
+    parser.add_argument("--use_wandb", action="store_true", default=config_bool(project_config, "train.use_wandb", False), help="是否使用wandb")
+    parser.add_argument("--wandb_project", type=str, default=config_get(project_config, "train.wandb_project", "MiniMind-Full-SFT"), help="wandb项目名")
+    parser.add_argument("--use_compile", default=int(config_bool(project_config, "train.use_compile", False)), type=int, choices=[0, 1], help="是否使用torch.compile加速（0=否，1=是）")
+    parser.add_argument("--save_each_epoch", default=int(config_bool(project_config, "train.save_each_epoch", True)), type=int, choices=[0, 1], help="是否在每个epoch结束时额外保存一个带epoch后缀的权重")
+    parser.add_argument("--eval_data_path", type=str, default=project_path(config_get(project_config, "train.eval_data_path")) if config_get(project_config, "train.eval_data_path") else "", help="可选：每个epoch结束后评测的calc测试集路径")
+    parser.add_argument("--eval_match_mode", type=str, default=config_get(project_config, "train.eval_match_mode", "answer_only"), choices=["full", "answer_only"], help="calc评测匹配方式")
+    parser.add_argument("--eval_max_new_tokens", type=int, default=config_get(project_config, "train.eval_max_new_tokens", 64), help="calc评测最大生成token数")
+    parser.add_argument("--eval_limit", type=int, default=config_get(project_config, "train.eval_limit", 0), help="可选：限制每轮评测样本数，0表示不限制")
+    parser.add_argument("--eval_show_examples", type=int, default=config_get(project_config, "train.eval_show_examples", 5), help="每轮评测打印多少个错误样例")
+    parser.add_argument("--eval_results_dir", type=str, default=project_path(config_get(project_config, "train.eval_results_dir", "./results")), help="每轮评测逐条结果jsonl的输出目录")
     args = parser.parse_args()
 
     # ========== 1. 初始化环境和随机种子 ==========
@@ -232,7 +245,18 @@ if __name__ == "__main__":
     
     # ========== 2. 配置目录、模型参数、检查ckp ==========
     os.makedirs(args.save_dir, exist_ok=True)
-    lm_config = MiniMindConfig(hidden_size=args.hidden_size, num_hidden_layers=args.num_hidden_layers, use_moe=bool(args.use_moe))
+    lm_config = ConfigClass(
+        hidden_size=args.hidden_size,
+        num_hidden_layers=args.num_hidden_layers,
+        num_attention_heads=args.num_attention_heads,
+        num_key_value_heads=args.num_key_value_heads,
+        intermediate_size=args.intermediate_size,
+        rms_norm_eps=args.rms_norm_eps,
+        use_qk_norm=args.use_qk_norm,
+        use_moe=bool(args.use_moe),
+        use_attention_gate=args.use_attention_gate,
+        attention_gate_scale=args.attention_gate_scale,
+    )
     ckp_data = lm_checkpoint(lm_config, weight=args.save_weight, save_dir='../checkpoints') if args.from_resume==1 else None
     
     # ========== 3. 设置混合精度 ==========
@@ -250,7 +274,7 @@ if __name__ == "__main__":
         wandb.init(project=args.wandb_project, name=wandb_run_name, id=wandb_id, resume=resume)
     
     # ========== 5. 定义模型、数据、优化器 ==========
-    model, tokenizer = init_model(lm_config, args.from_weight, device=args.device)
+    model, tokenizer = init_model(lm_config, args.from_weight, tokenizer_path=args.tokenizer_path, save_dir=args.save_dir, device=args.device, model_class=ModelClass)
     train_ds = SFTDataset(args.data_path, tokenizer, max_length=args.max_seq_len)
     train_sampler = DistributedSampler(train_ds) if dist.is_initialized() else None
     scaler = torch.cuda.amp.GradScaler(enabled=(args.dtype == 'float16'))

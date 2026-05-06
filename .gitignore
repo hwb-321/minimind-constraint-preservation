@@ -5,7 +5,7 @@ out
 website/
 docs-minimind/
 .codex
-dataset/*.jsonl
+dataset/
 *.bak*
 *.pth
 checkpoints/
@@ -14,3 +14,7 @@ result_all/
 result_all_attention_fix/
 result_noise_fold_smoke/
 result_suffix_anchor/
+.venv/
+models/
+swanlog/
+*.pdf

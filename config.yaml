@@ -1,0 +1,66 @@
+model:
+  module: model.model_minimind
+  config_class: MiniMindConfig
+  model_class: MiniMindForCausalLM
+  save_dir: ./models
+  tokenizer_path: ./model
+  weight: full_sft
+  hidden_size: 768
+  num_hidden_layers: 8
+  num_attention_heads: 8
+  num_key_value_heads: 4
+  intermediate_size: 2432
+  rms_norm_eps: 0.000001
+  use_qk_norm: true
+  use_moe: false
+
+attention_gate:
+  enabled: false
+  scale: 2.0
+
+yarn:
+  inference_rope_scaling: false
+  original_max_position_embeddings: 2048
+  factor: 16.0
+  beta_fast: 32.0
+  beta_slow: 1.0
+  attention_factor: 1.0
+
+train:
+  save_weight: full_sft_gate
+  epochs: 2
+  batch_size: 16
+  learning_rate: 0.00001
+  device: auto
+  dtype: bfloat16
+  num_workers: 8
+  accumulation_steps: 1
+  grad_clip: 1.0
+  log_interval: 100
+  save_interval: 1000
+  max_seq_len: 768
+  data_path: ./dataset/sft_calc_addition_train.jsonl
+  from_weight: full_sft
+  from_resume: false
+  use_wandb: false
+  wandb_project: MiniMind-Full-SFT
+  use_compile: false
+  save_each_epoch: true
+  eval_data_path: ""
+  eval_match_mode: answer_only
+  eval_max_new_tokens: 64
+  eval_limit: 0
+  eval_show_examples: 5
+  eval_results_dir: ./results
+
+eval:
+  weight: full_sft
+  data_path: ./dataset/sft_calc_addition_test.jsonl
+  device: auto
+  max_new_tokens: 64
+  limit: 0
+  match_mode: answer_only
+  show_examples: 5
+  results_path: ""
+  targeted_attention_mode: none
+  attention_keep_prefix: 0

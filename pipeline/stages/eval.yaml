@@ -1,0 +1,23 @@
+script: scripts/eval_calc_dataset.py
+weight: sft_zero_calc_sft_alpha256
+runtime:
+  cuda_visible_devices: ""
+args:
+  save_dir: ./models
+  tokenizer_path: ./model
+  hidden_size: 768
+  num_hidden_layers: 8
+  num_attention_heads: 8
+  num_key_value_heads: 4
+  intermediate_size: 2432
+  rms_norm_eps: 0.000001
+  match_mode: answer_only
+  max_new_tokens: 64
+  batch_size: 16
+  progress_interval: 100
+  show_examples: 0
+  targeted_attention_mode: none
+datasets:
+  clean: ./dataset/sft_calc_addition_test.jsonl
+  alpha256: ./dataset/sft_calc_addition_test_alpha_noise_len256_seed42.jsonl
+  alpha512: ./dataset/sft_calc_addition_test_alpha_noise_len512_seed42.jsonl
